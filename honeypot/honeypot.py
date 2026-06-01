@@ -9,16 +9,12 @@ from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import box
 
-# Credits:
-# General repo credits.
-# Thanks to Matt for the cog idea!
-
 _: Translator = Translator("Honeypot", __file__)
 
 
 @cog_i18n(_)
 class Honeypot(Cog):
-    """Create a channel at the top of the server to attract self bots/scammers and notify/mute/kick/ban them immediately!"""
+    """Create a channel at the top of the server to attract self bots/scammers and notify/mute/kick/ban/softban them immediately!"""
 
     def __init__(self, bot: Red) -> None:
         super().__init__(bot=bot)
@@ -36,6 +32,7 @@ class Honeypot(Cog):
             honeypot_channel=None,
             mute_role=None,
             ban_delete_message_days=3,
+            kicks=0,  # Counter for honeypot catches
         )
 
         _settings: dict[str, dict[str, typing.Any]] = {
@@ -44,7 +41,7 @@ class Honeypot(Cog):
                 "description": "Toggle the cog.",
             },
             "action": {
-                "converter": typing.Literal["mute", "kick", "ban"],
+                "converter": typing.Literal["mute", "kick", "ban", "softban"],
                 "description": "The action to take when a self bot/scammer is detected.",
             },
             "logs_channel": {
@@ -84,6 +81,35 @@ class Honeypot(Cog):
         await super().cog_load()
         await self.settings.add_commands()
 
+    async def update_honeypot_message(self, guild: discord.Guild) -> None:
+        """Update the honeypot channel's warning message with current kicks count."""
+        config = await self.config.guild(guild).all()
+        honeypot_channel_id = config.get("honeypot_channel")
+        if not honeypot_channel_id:
+            return
+
+        honeypot_channel = guild.get_channel(honeypot_channel_id)
+        if not honeypot_channel or not isinstance(honeypot_channel, discord.TextChannel):
+            return
+
+        kicks = config.get("kicks", 0)
+
+        # Look for existing warning message (the one with the image)
+        async for message in honeypot_channel.history(limit=10):
+            if message.author == guild.me and message.embeds:
+                embed = message.embeds[0]
+                if "DO NOT POST HERE" in embed.title:
+                    # Update footer with honey pot and counter
+                    embed.set_footer(
+                        text=f"🍯 Kicks: {kicks}",
+                        icon_url=None
+                    )
+                    try:
+                        await message.edit(embed=embed)
+                    except discord.HTTPException:
+                        pass
+                    return
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None:
@@ -92,6 +118,7 @@ class Honeypot(Cog):
             return
         if message.author.bot:
             return
+
         config = await self.config.guild(message.guild).all()
         if (
             not config["enabled"]
@@ -110,10 +137,16 @@ class Honeypot(Cog):
             or message.author.top_role >= message.guild.me.top_role
         ):
             return
+
         try:
             await message.delete()
         except discord.HTTPException:
             pass
+
+        # Increment kicks counter
+        await self.config.guild(message.guild).kicks.set(config["kicks"] + 1)
+        await self.update_honeypot_message(message.guild)
+
         action = config["action"]
         embed: discord.Embed = discord.Embed(
             title=_("Honeypot — Self Bot/Scammer Detected!"),
@@ -126,6 +159,7 @@ class Honeypot(Cog):
             icon_url=message.author.display_avatar,
         )
         embed.set_thumbnail(url=message.author.display_avatar)
+
         failed = None
         if action is not None:
             reason = "Self bot/scammer detected (message in the HoneyPot channel)."
@@ -144,38 +178,45 @@ class Honeypot(Cog):
                         reason=reason,
                         delete_message_days=config["ban_delete_message_days"],
                     )
+                elif action == "softban":
+                    await message.author.ban(
+                        reason=reason + " (Softban)",
+                        delete_message_days=config["ban_delete_message_days"],
+                    )
+                    await message.guild.unban(message.author, reason="Softban - purging messages")
             except discord.HTTPException as e:
                 failed = _(
                     "**Failed:** An error occurred while trying to take action against the member:\n",
                 ) + box(str(e), lang="py")
             else:
+                modlog_action = action if action != "mute" else "smute"
                 await modlog.create_case(
                     self.bot,
                     message.guild,
                     message.created_at,
-                    action_type=action if action != "mute" else "smute",
+                    action_type=modlog_action,
                     user=message.author,
                     moderator=message.guild.me,
                     reason=reason,
                 )
+
+            action_text = {
+                "mute": _("The member has been muted."),
+                "kick": _("The member has been kicked."),
+                "ban": _("The member has been banned."),
+                "softban": _("The member has been softbanned."),
+            }.get(action, _("Action taken."))
+
             embed.add_field(
                 name=_("Action:"),
-                value=(
-                    (
-                        _("The member has been muted.")
-                        if action == "mute"
-                        else (
-                            _("The member has been kicked.")
-                            if action == "kick"
-                            else _("The member has been banned.")
-                        )
-                    )
-                    if failed is None
-                    else failed
-                ),
+                value=action_text if failed is None else failed,
                 inline=False,
             )
-        embed.set_footer(text=message.guild.name, icon_url=message.guild.icon)
+
+        # Updated footer with honey pot and kicks counter
+        kicks = await self.config.guild(message.guild).kicks()
+        embed.set_footer(text=f"🍯 Kicks: {kicks}")
+
         await logs_channel.send(
             content=(
                 ping_role.mention
@@ -208,6 +249,7 @@ class Honeypot(Cog):
                     "The honeypot channel already exists: {honeypot_channel.mention} ({honeypot_channel.id}).",
                 ).format(honeypot_channel=honeypot_channel),
             )
+
         honeypot_channel = await ctx.guild.create_text_channel(
             name="honeypot",
             position=0,
@@ -227,10 +269,11 @@ class Honeypot(Cog):
             },
             reason=f"Honeypot channel creation requested by {ctx.author.display_name} ({ctx.author.id}).",
         )
+
         embed = discord.Embed(
             title=_("⚠️ DO NOT POST HERE! ⚠️"),
             description=_(
-                "An action will be immediately taken against you if you send a message in this channel.",
+                "This channel is used to catch spam bots. Any messages sent here will result in a softban."
             ),
             color=discord.Color.red(),
         )
@@ -241,20 +284,24 @@ class Honeypot(Cog):
         )
         embed.add_field(
             name=_("What WILL happen?"),
-            value=_("An action will be taken against you."),
+            value=_("You will be softbanned (or the configured action)."),
             inline=False,
         )
-        embed.set_footer(text=ctx.guild.name, icon_url=ctx.guild.icon)
+
+        # Initial footer with honey pot
+        embed.set_footer(text="🍯 Kicks: 0")
         embed.set_image(url="attachment://do_not_post_here.png")
+
         await honeypot_channel.send(
             content=_("## ⚠️ WARNING ⚠️"),
             embed=embed,
             files=[discord.File(os.path.join(os.path.dirname(__file__), "do_not_post_here.png"))],
         )
+
         await self.config.guild(ctx.guild).honeypot_channel.set(honeypot_channel.id)
         await ctx.send(
             _(
-                "The honeypot channel has been set to {honeypot_channel.mention} ({honeypot_channel.id}). You can now start attracting self bots/scammers!\n"
-                "Please make sure to enable the cog and set the logs channel, the action to take, the role to ping (and the mute role) if you haven't already.",
+                "The honeypot channel has been set to {honeypot_channel.mention} ({honeypot_channel.id}).\n"
+                "You can now start attracting self bots/scammers!"
             ).format(honeypot_channel=honeypot_channel),
         )
