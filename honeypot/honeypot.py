@@ -32,7 +32,7 @@ class Honeypot(Cog):
             honeypot_channel=None,
             mute_role=None,
             ban_delete_message_days=3,
-            kicks=0,  # Counter for honeypot catches
+            potted=0,  # Total number of bots potted (any action)
         )
 
         _settings: dict[str, dict[str, typing.Any]] = {
@@ -82,7 +82,7 @@ class Honeypot(Cog):
         await self.settings.add_commands()
 
     async def update_honeypot_message(self, guild: discord.Guild) -> None:
-        """Update the honeypot channel's warning message with current kicks count."""
+        """Update the honeypot channel's warning message with current potted count."""
         config = await self.config.guild(guild).all()
         honeypot_channel_id = config.get("honeypot_channel")
         if not honeypot_channel_id:
@@ -92,16 +92,14 @@ class Honeypot(Cog):
         if not honeypot_channel or not isinstance(honeypot_channel, discord.TextChannel):
             return
 
-        kicks = config.get("kicks", 0)
+        potted = config.get("potted", 0)
 
-        # Look for existing warning message (the one with the image)
         async for message in honeypot_channel.history(limit=10):
             if message.author == guild.me and message.embeds:
                 embed = message.embeds[0]
-                if "DO NOT POST HERE" in embed.title:
-                    # Update footer with honey pot and counter
+                if "DO NOT POST HERE" in embed.title or "DO NOT SEND MESSAGES" in embed.title:
                     embed.set_footer(
-                        text=f"🍯 Kicks: {kicks}",
+                        text=f"🍯 Potted: {potted}",
                         icon_url=None
                     )
                     try:
@@ -143,8 +141,8 @@ class Honeypot(Cog):
         except discord.HTTPException:
             pass
 
-        # Increment kicks counter
-        await self.config.guild(message.guild).kicks.set(config["kicks"] + 1)
+        # Increment potted counter for ANY action
+        await self.config.guild(message.guild).potted.set(config["potted"] + 1)
         await self.update_honeypot_message(message.guild)
 
         action = config["action"]
@@ -213,9 +211,9 @@ class Honeypot(Cog):
                 inline=False,
             )
 
-        # Updated footer with honey pot and kicks counter
-        kicks = await self.config.guild(message.guild).kicks()
-        embed.set_footer(text=f"🍯 Kicks: {kicks}")
+        # Updated footer with honey pot + Potted counter
+        potted = await self.config.guild(message.guild).potted()
+        embed.set_footer(text=f"🍯 Potted: {potted}")
 
         await logs_channel.send(
             content=(
@@ -271,7 +269,7 @@ class Honeypot(Cog):
         )
 
         embed = discord.Embed(
-            title=_("⚠️ DO NOT POST HERE! ⚠️"),
+            title=_("⚠️ DO NOT SEND MESSAGES IN THIS CHANNEL ⚠️"),
             description=_(
                 "This channel is used to catch spam bots. Any messages sent here will result in a softban."
             ),
@@ -288,8 +286,8 @@ class Honeypot(Cog):
             inline=False,
         )
 
-        # Initial footer with honey pot
-        embed.set_footer(text="🍯 Kicks: 0")
+        # Initial footer with honey pot and potted counter
+        embed.set_footer(text="🍯 Potted: 0")
         embed.set_image(url="attachment://do_not_post_here.png")
 
         await honeypot_channel.send(
